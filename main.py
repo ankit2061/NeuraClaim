@@ -16,11 +16,21 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import uvicorn
+from fastapi.middleware.cors import CORSMiddleware
 
 # Initialize FastAPI app
-app = FastAPI(title="Document Processor API", 
-              description="API for processing and extracting information from documents",
-              version="1.0.0")
+app = FastAPI(title="Document Processor API",
+             description="API for processing and extracting information from documents",
+             version="1.0.0")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # For development only. In production, specify your domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Load spaCy model
 try:
@@ -59,20 +69,17 @@ def preprocess_image(image_path):
     image = cv2.imread(image_path)
     if image is None:
         return None
-
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 2)
     kernel = np.ones((1, 1), np.uint8)
     processed_image = cv2.dilate(binary, kernel, iterations=1)
     processed_image = cv2.erode(processed_image, kernel, iterations=1)
-
     return processed_image
 
 def extract_text_from_image(image_path):
     preprocessed_image = preprocess_image(image_path)
     if preprocessed_image is None:
         return ""
-
     pil_image = Image.fromarray(preprocessed_image)
     try:
         text = pytesseract.image_to_string(pil_image)
@@ -100,194 +107,86 @@ def extract_aadhaar_number(text):
     """
     # Clean the text first - this can help with OCR errors
     cleaned_text = re.sub(r'\s+', ' ', text)
-    
     # Method 1: Look for common Aadhaar number patterns (12 digits with or without separators)
     aadhaar_patterns = [
         # Pattern with no separators - 12 consecutive digits
         r'(?<!\d)(\d{12})(?!\d)',
-        # Pattern with space separators
+        # Pattern with spaces like "1234 5678 9012"
         r'(\d{4}\s+\d{4}\s+\d{4})',
-        # Pattern with dash separators
-        r'(\d{4}-\d{4}-\d{4})',
-        # Pattern with dot separators
-        r'(\d{4}\.\d{4}\.\d{4})'
+        # Pattern with dashes like "1234-5678-9012"
+        r'(\d{4}-\d{4}-\d{4})'
     ]
     
     for pattern in aadhaar_patterns:
-        matches = re.findall(pattern, cleaned_text)
+        matches = re.search(pattern, cleaned_text)
         if matches:
-            # Clean up the found number (remove spaces, dashes)
-            aadhaar = re.sub(r'[^\d]', '', matches[0])
-            if len(aadhaar) == 12:
-                return aadhaar
+            # Remove any spaces or dashes for consistent format
+            aadhaar = re.sub(r'[-\s]', '', matches.group(0))
+            return aadhaar
     
-    # Method 2: Look for Aadhaar numbers with keywords
-    keyword_patterns = [
-        # Various ways "Aadhaar" might be written followed by a number
-        r'(?:aadhar|aadhaar|adhar|aadha+r|आधार)(?:\s*(?:card|number|no|id|#|:|नंबर|संख्या))?\s*[:\.\-]?\s*((?:\d[\d\s\.\-]*){12})',
-        r'(?:uid|unique\s+id)(?:\s*(?:number|no|#))?\s*[:\.\-]?\s*((?:\d[\d\s\.\-]*){12})',
-        # Looking for "No:" or "Number:" followed by what could be an Aadhaar
-        r'(?:no|number|id)?\s*[:\.\-]\s*((?:\d[\d\s\.\-]*){12})'
-    ]
-    
-    for pattern in keyword_patterns:
-        matches = re.findall(pattern, cleaned_text.lower())
-        if matches:
-            # Clean up the found number
-            aadhaar = re.sub(r'[^\d]', '', matches[0])
-            if len(aadhaar) == 12:
-                return aadhaar
-    
-    # Method 3: More aggressive - find any 12-digit sequence that could be an Aadhaar number
-    digit_sequences = re.findall(r'(?<!\d)(\d[\d\s\.\-]*\d)(?!\d)', cleaned_text)
-    for seq in digit_sequences:
-        digits_only = re.sub(r'[^\d]', '', seq)
-        if len(digits_only) == 12:
-            return digits_only
-            
     return None
 
-def clean_extracted_field(text, field_type):
+def process_text(text, key_phrases):
     """
-    Cleans extracted text based on field type to remove common OCR artifacts
-    and mislabeled content
-    """
-    # Convert to string in case we received another type
-    text = str(text).strip()
-    
-    # Remove common label text that might be captured within the value
-    unwanted_labels = [
-        "Phone Number", "Contact", "Mobile", "Call",
-        "Hospital Name", "Doctor", "Clinic", "MD", "Dr\\.",
-        "Address", "Location", "Place", "Residence",
-        "Insurance ID", "Policy Number", "Insurance",
-        "Amount", "Total", "Fee", "Payment",
-        "Disease", "Diagnosis", "Condition",
-        "Medicines", "Medication", "Drugs", "Prescription"
-    ]
-    
-    # For each unwanted label, try to remove it if it appears at the end
-    for label in unwanted_labels:
-        # Create pattern to match label at the end of the text (allowing for spaces)
-        pattern = rf'\s*{re.escape(label)}$'
-        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
-    
-    # Remove common field separators
-    text = re.sub(r'[:;|]$', '', text)
-    
-    # Clean up newlines and extra spaces
-    text = re.sub(r'\n+', ' ', text)
-    text = re.sub(r'\s+', ' ', text)
-    
-    # Additional field-specific cleaning
-    if field_type in ["Address"]:
-        # Keep only relevant address information
-        text = re.sub(r'\s*(?:Phone|Mobile|Contact|Email).*$', '', text, flags=re.IGNORECASE)
-    
-    elif field_type in ["Hospital Name"]:
-        # Remove doctor references
-        text = re.sub(r'\s*(?:Doctor|Dr\.|MD|Physician).*$', '', text, flags=re.IGNORECASE)
-    
-    elif field_type in ["Phone Number"]:
-        # Keep only digits and basic formatting characters
-        text = re.sub(r'[^\d+\-\s()]', '', text)
-    
-    return text.strip()
-
-def extract_fields_with_boundaries(text):
-    """
-    Extract fields with improved boundary detection to prevent label bleed
+    Process text to extract important information based on key phrases.
+    Uses multiple approaches for robust extraction.
     """
     extracted_info = []
     found_labels = set()
     
-    # Dictionary of field patterns with better boundary detection
-    field_patterns = {
-        "Name": r'(?:Patient(?:\s*Name)?|Name|Patient)[:;]?\s*([\w\s\.]+?)(?=\n|$|(?:Father|Gender|Blood|Aadhaar))',
-        "Father's Name": r'(?:Father(?:[\'s]*\s*Name)?|Father)[:;]?\s*([\w\s\.]+?)(?=\n|$|(?:Gender|Blood|Aadhaar))',
-        "Gender": r'(?:Gender|Sex)[:;]?\s*(Male|Female|Other|M|F)(?=\n|$)',
-        "Blood Group": r'(?:Blood(?:\s*Group)?)[:;]?\s*([ABO][+-]|AB[+-])(?=\n|$)',
-        "Address": r'(?:Address|Location|Place|Residence)[:;]?\s*([\w\s,\.\-\/]+?)(?=\n|$|(?:Phone|Mobile|Contact|Email))',
-        "Hospital Name": r'(?:Hospital(?:\s*Name)?|Clinic|Medical Center)[:;]?\s*([\w\s\.]+?)(?=\n|$|(?:Doctor|Dr|MD|Address))',
-        "Insurance ID": r'(?:Insurance(?:\s*(?:ID|Number|No))?|Policy(?:\s*Number)?)[:;]?\s*([\w\d\-]+?)(?=\n|$)',
-        "Phone Number": r'(?:Phone(?:\s*Number)?|Mobile|Contact|Cell)[:;]?\s*([\d\s\+\-\(\)]+?)(?=\n|$)',
-        "Amount": r'(?:Amount|Total|Cost|Fee|Charges)[:;]?\s*([\d\.]+?)(?=\n|$|Rs|\$|₹)',
-        "Disease Name": r'(?:Disease(?:\s*Name)?|Diagnosis|Condition|Ailment)[:;]?\s*([\w\s]+?)(?=\n|$|(?:Disease Details|Symptoms|Treatment))',
-        "Disease Details": r'(?:Disease(?:\s*Details)?|Details|Diagnosis Details|Clinical Details|Symptoms)[:;]?\s*([\w\s,\.;\(\)\-\/]+?)(?=\n\n|\n(?:Medicines|Medications|Drugs)|$)',
-        "Medicines": r'(?:Medicines|Medications|Drugs|Prescriptions|Medicine List)[:;]?\s*([\w\s,\.;\(\)\-\/]+?)(?=\n\n|\n(?:Bed|Ventilation|Amount|Charges)|$)',
-        "Bed Type": r'(?:Bed(?:\s*Type)?)[:;]?\s*([\w\s]+?)(?=\n|$)',
-        "Ventilation": r'(?:Ventilation|Ventilator|Oxygen)[:;]?\s*(Yes|No|Required|Not Required)(?=\n|$)',
-        "Other Charges": r'(?:Other(?:\s*Charges)?|Additional(?:\s*Charges)?|Extra)[:;]?\s*([\d\.]+?)(?=\n|$|Rs|\$|₹)'
-    }
-    
-    # 1. First pass: Extract Aadhaar number with dedicated function
-    aadhaar = extract_aadhaar_number(text)
-    if aadhaar:
-        formatted_aadhaar = f"{aadhaar[:4]}-{aadhaar[4:8]}-{aadhaar[8:]}"
-        extracted_info.append({"Text": formatted_aadhaar, "Label": "Aadhar Card"})
-        found_labels.add("Aadhar Card")
-    
-    # 2. Second pass: Extract other fields with improved boundary detection
-    for label, pattern in field_patterns.items():
-        if label in found_labels:
-            continue
-            
-        matches = re.search(pattern, text, re.IGNORECASE)
+    # 1. First pass: Look for key phrases and extract the following text
+    for phrase in key_phrases:
+        label = phrase.rstrip(':')
+        pattern = fr'{re.escape(phrase)}\s*([^:]+?)(?=\s*(?:{"|".join([re.escape(p) for p in key_phrases])})|$)'
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        
         if matches:
-            extracted_text = matches.group(1).strip()
-            # Clean the extracted text to remove potential label contamination
-            cleaned_text = clean_extracted_field(extracted_text, label)
-            
-            # Only add if we have meaningful content
-            if cleaned_text and len(cleaned_text) > 0:
+            cleaned_text = matches[0].strip()
+            if cleaned_text:
                 extracted_info.append({"Text": cleaned_text, "Label": label})
                 found_labels.add(label)
+    
+    # 2. Second pass: Use NLP to identify entities
+    doc = nlp(text)
+    
+    for ent in doc.ents:
+        label = None
+        if ent.label_ == "PERSON" and "Name" not in found_labels:
+            label = "Name"
+        elif ent.label_ == "GPE" and "Address" not in found_labels:
+            label = "Address"
+        elif ent.label_ == "ORG" and "Hospital Name" not in found_labels:
+            label = "Hospital Name"
+        
+        if label:
+            cleaned_text = ent.text.strip()
+            if cleaned_text:
+                extracted_info.append({"Text": cleaned_text, "Label": label})
+                found_labels.add(label)
+    
+    # Special handling for Aadhaar numbers
+    if "Aadhar Card" not in found_labels:
+        aadhaar = extract_aadhaar_number(text)
+        if aadhaar:
+            extracted_info.append({"Text": aadhaar, "Label": "Aadhar Card"})
+            found_labels.add("Aadhar Card")
     
     # 3. Third pass: Look for unlabeled numbers that might be specific fields
     if "Phone Number" not in found_labels:
         # Look for potential phone numbers (10-digit sequences)
         phone_matches = re.search(r'(?<!\d)(\d{10})(?!\d)', text)
         if phone_matches:
-            extracted_info.append({"Text": phone_matches.group(1), "Label": "Phone Number"})
+            extracted_info.append({"Text": phone_matches.group(0), "Label": "Phone Number"})
             found_labels.add("Phone Number")
     
-    # Look for Appendicitis or other common conditions if disease name not found
-    if "Disease Name" not in found_labels:
-        common_diseases = ["appendicitis", "diabetes", "hypertension", "cancer", "fracture", "pneumonia"]
-        for disease in common_diseases:
-            if re.search(rf'\b{disease}\b', text, re.IGNORECASE):
-                extracted_info.append({"Text": disease.capitalize(), "Label": "Disease Name"})
-                found_labels.add("Disease Name")
-                break
-    
-    return extracted_info
-
-def process_text(text, keywords=[]):
-    """
-    Main processing function that combines extraction methods
-    """
-    # Get fields using improved boundary detection
-    extracted_info = extract_fields_with_boundaries(text)
-    
-    # For backward compatibility, still use keyword-based extraction for any missing fields
-    found_labels = {item["Label"] for item in extracted_info}
-    
-    for keyword in keywords:
-        # Skip keywords for fields we already found
-        label = keyword.replace(":", "").strip()
-        if any(label in existing for existing in found_labels):
-            continue
-            
-        # Simple keyword-based extraction as fallback
-        pattern = re.compile(rf"{re.escape(keyword)}\s*([\w\s\d\.\-]+?)(?=\n|$)", re.IGNORECASE)
-        match = pattern.search(text)
-        if match:
-            extracted_text = match.group(1).strip()
-            cleaned_text = clean_extracted_field(extracted_text, label)
-            
-            if cleaned_text and len(cleaned_text) > 0:
-                extracted_info.append({"Text": cleaned_text, "Label": label})
-                found_labels.add(label)
+    if "Amount" not in found_labels:
+        # Look for currency amounts
+        amount_matches = re.search(r'(?:Rs\.?|INR)\s*(\d+(?:[,.]\d+)*)', text)
+        if amount_matches:
+            cleaned_text = re.sub(r'[^\d.]', '', amount_matches.group(0))
+            if cleaned_text:
+                extracted_info.append({"Text": cleaned_text, "Label": "Amount"})
+                found_labels.add("Amount")
     
     return extracted_info
 
@@ -295,21 +194,21 @@ def save_to_database(data, insurance_id, file_path):
     try:
         cnx = mysql.connector.connect(**DB_CONFIG)
         cursor = cnx.cursor()
-
+        
         # Insert document information into the 'patient_documents' table
         insert_doc_query = "INSERT INTO patient_documents (insurance_id, file_path) VALUES (%s, %s)"
         doc_values = (insurance_id, file_path)
         cursor.execute(insert_doc_query, doc_values)
-
+        
         # Modified query to exclude the ventilation and appointment_time columns
         insert_patient_query = """
-        INSERT INTO patient_details 
-        (insurance_id, name, father_name, aadhar_card, gender, blood_group, 
-        address, hospital_name, phone_number, amount, 
-        disease_name, disease_details, medicines, bed_type, other_charges) 
+        INSERT INTO patient_details
+        (insurance_id, name, father_name, aadhar_card, gender, blood_group,
+        address, hospital_name, phone_number, amount,
+        disease_name, disease_details, medicines, bed_type, other_charges)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
-
+        
         name = next((item["Text"] for item in data if item["Label"] == "Name"), None)
         father_name = next((item["Text"] for item in data if item["Label"] == "Father's Name"), None)
         aadhar_card = next((item["Text"] for item in data if item["Label"] == "Aadhar Card"), None)
@@ -343,14 +242,13 @@ def save_to_database(data, insurance_id, file_path):
                     other_charges = float(other_charges)
                 except ValueError:
                     other_charges = None
-
+        
         # Note: ventilation and appointment_time are removed from the values tuple
-        patient_values = (insurance_id, name, father_name, aadhar_card, gender, blood_group, 
-                          address, hospital_name, phone_number, amount, 
+        patient_values = (insurance_id, name, father_name, aadhar_card, gender, blood_group,
+                          address, hospital_name, phone_number, amount,
                           disease_name, disease_details, medicines, bed_type, other_charges)
         
         cursor.execute(insert_patient_query, patient_values)
-
         cnx.commit()
         cursor.close()
         cnx.close()
@@ -366,13 +264,13 @@ async def process_file_api(file_path):
             text = extract_text_from_image(file_path)
         elif file_path.lower().endswith('.pdf'):
             text = extract_text_from_pdf(file_path)
-
+        
         if not text.strip():
             return None, "No text detected in the file."
-
-        important_info = process_text(text, ["Name:", "Father's Name:", "Aadhar Card:", "Gender:", "Blood Group:", 
-                                             "Address:", "Hospital Name:", "Insurance ID:", "Phone Number:", 
-                                             "Amount:", "Disease Name:", "Disease Details:", "Medicines:", 
+        
+        important_info = process_text(text, ["Name:", "Father's Name:", "Aadhar Card:", "Gender:", "Blood Group:",
+                                             "Address:", "Hospital Name:", "Insurance ID:", "Phone Number:",
+                                             "Amount:", "Disease Name:", "Disease Details:", "Medicines:",
                                              "Bed Type:", "Ventilation:", "Other Charges:"])
         
         return text, important_info
@@ -416,7 +314,6 @@ async def process_document(file: UploadFile = File(...)):
             extracted_text=extracted_text,
             extracted_info=formatted_info
         )
-        
     except Exception as e:
         return JSONResponse(
             status_code=500,
@@ -476,7 +373,6 @@ async def save_document_data(file: UploadFile = File(...)):
                 status_code=500,
                 content={"success": False, "message": "Failed to save data to database."}
             )
-        
     except Exception as e:
         return JSONResponse(
             status_code=500,
