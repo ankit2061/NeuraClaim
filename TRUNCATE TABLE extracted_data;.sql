@@ -1,0 +1,1 @@
+TRUNCATE TABLE extracted_data;
